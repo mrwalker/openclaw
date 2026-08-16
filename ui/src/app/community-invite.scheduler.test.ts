@@ -21,6 +21,9 @@ const stops: Array<() => void> = [];
 let visibility: DocumentVisibilityState = "visible";
 let focused = true;
 let lockHolders: Set<string>;
+/** Lets a test land an event inside the claim's await, where the scheduler is
+ * committed but the card has not reached the DOM yet. */
+let onLockAcquired: (() => void) | null = null;
 
 function seedRecord(record: Partial<CommunityInviteRecord> = {}): void {
   localStorage.setItem(
@@ -53,6 +56,7 @@ function installWebLocks(): void {
           return Promise.resolve(callback(null));
         }
         lockHolders.add(name);
+        onLockAcquired?.();
         return Promise.resolve(callback({ name })).finally(() => lockHolders.delete(name));
       },
     },
@@ -104,6 +108,7 @@ beforeEach(() => {
   visibility = "visible";
   focused = true;
   lockHolders = new Set();
+  onLockAcquired = null;
   document.openClawModalToastLayers = new Set();
   Object.defineProperty(document, "visibilityState", {
     configurable: true,
@@ -411,17 +416,20 @@ describe("community invite live eligibility", () => {
     expect(mountedCards()).toBe(1);
   });
 
-  it("never burns the tombstone for a state that turns unquiet during the chunk import", async () => {
+  it("defers rather than settles when the state turns unquiet during the chunk import", async () => {
     seedRecord();
     // The chunk import and the claim both cross an await after tryPresent's
-    // synchronous check already passed. Answering true only the first time
-    // stands in for a modal, a toast, a disconnect, or a new run arriving in
-    // that exact gap: whichever one it is, `present()` must re-check and refuse
-    // rather than mount a card and burn the one-shot tombstone on it.
+    // synchronous check already passed. Going ineligible exactly once, at that
+    // first check, stands in for a modal, a toast, a disconnect, or a new run
+    // arriving in that gap: `present()` must re-check and refuse rather than
+    // mount a card and burn the one-shot tombstone on it.
+    let eligible = true;
     let calls = 0;
     start(true, () => {
       calls += 1;
-      return calls === 1;
+      const answer = eligible;
+      eligible = calls > 1;
+      return answer;
     });
 
     await vi.advanceTimersByTimeAsync(DWELL_MS);
@@ -430,5 +438,28 @@ describe("community invite live eligibility", () => {
     expect(calls).toBeGreaterThan(1);
     expect(mountedCards()).toBe(0);
     expect(storedRecord()?.shownAtMs).toBeUndefined();
+
+    // Nothing was claimed and nothing was recorded, so the deferral must not have
+    // retired the watchers: the next quiet, eligible moment still owes the card.
+    document.dispatchEvent(new Event("focusout"));
+    await flushPresentation();
+    expect(mountedCards()).toBe(1);
+    expect(storedRecord()?.shownAtMs).toBeGreaterThan(0);
+  });
+
+  it("mounts nothing when the shell disposes inside the claim", async () => {
+    seedRecord();
+    let dispose: () => void = () => undefined;
+    // The claim crosses an await of its own. A shell teardown landing there leaves
+    // a stamped tombstone and no owner left to remove a card, so nothing may mount.
+    onLockAcquired = () => dispose();
+    dispose = start();
+
+    await vi.advanceTimersByTimeAsync(DWELL_MS);
+    await flushPresentation();
+
+    expect(mountedCards()).toBe(0);
+    // Stamped inside the lock, so the invite stays retired rather than returning.
+    expect(storedRecord()?.shownAtMs).toBeGreaterThan(0);
   });
 });
